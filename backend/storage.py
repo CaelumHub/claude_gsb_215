@@ -219,9 +219,7 @@ class Storage:
                 if os.path.isfile(ap):
                     os.unlink(ap)
             # Remove version snapshots for this file.
-            for vp in self._version_glob(file_id):
-                if os.path.isfile(vp):
-                    os.unlink(vp)
+            self._delete_versions(file_id)
 
         before = self.get_file(file_id)
         if before is None:
@@ -307,15 +305,19 @@ class Storage:
             project["version"] = int(project.get("version", 0)) + 1
             project["updated_at"] = now_iso()
             atomic_write(path, project)
-        self._snapshot_project(project)
+            self._snapshot_project(project)
         return project
 
     def delete_project(self, project_id: str) -> bool:
         path = self._project_path(project_id)
         if not os.path.isfile(path):
             return False
+        # Remove the project and all of its version snapshots together, under
+        # the same lock used by project mutations, so no concurrent update can
+        # leave a fresh orphan snapshot behind.
         with locked(path + ".lock"):
             os.unlink(path)
+            self._delete_versions(project_id)
         return True
 
     # -- version history -------------------------------------------------- #
@@ -324,6 +326,19 @@ class Storage:
         prefix = f"{target_id}__"
         return [os.path.join(self.versions_dir, n) for n in os.listdir(self.versions_dir)
                 if n.startswith(prefix) and n.endswith(".json")]
+
+    def _delete_versions(self, target_id: str) -> None:
+        """Remove every version snapshot (and its lock file) for a file or project."""
+        prefix = f"{target_id}__"
+        for name in os.listdir(self.versions_dir):
+            if not name.startswith(prefix):
+                continue
+            vp = os.path.join(self.versions_dir, name)
+            if os.path.isfile(vp):
+                os.unlink(vp)
+            lock_path = vp + ".lock"
+            if name.endswith(".json") and os.path.isfile(lock_path):
+                os.unlink(lock_path)
 
     def _snapshot_project(self, project: Dict[str, Any]) -> None:
         vid = f"{project['id']}__{int(project.get('version', 1)):04d}.json"
@@ -360,7 +375,7 @@ class Storage:
             restored["updated_at"] = now_iso()
             restored["reverted_from"] = int(current.get("version", 0))
             atomic_write(path, restored)
-        self._snapshot_project(restored)
+            self._snapshot_project(restored)
         return restored
 
     # -- stats ------------------------------------------------------------ #
@@ -371,7 +386,11 @@ class Storage:
         total_bytes = sum(f.get("size_bytes", 0) for f in files.values())
         analyses = [n for n in os.listdir(self.analysis_dir) if n.endswith(".json")]
         projects = [n for n in os.listdir(self.projects_dir) if n.endswith(".json")]
-        versions = [n for n in os.listdir(self.versions_dir) if n.endswith(".json")]
+        # Only count snapshots that still belong to an existing project; snapshots
+        # left behind by a deleted project must never inflate the total.
+        existing = {n[:-len(".json")] for n in projects}
+        versions = [n for n in os.listdir(self.versions_dir)
+                    if n.endswith(".json") and n.split("__", 1)[0] in existing]
         return {
             "files": len(files),
             "total_bytes": total_bytes,
