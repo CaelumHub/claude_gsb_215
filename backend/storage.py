@@ -281,7 +281,7 @@ class Storage:
         }
         with locked(self._project_path(project["id"]) + ".lock"):
             atomic_write(self._project_path(project["id"]), project)
-        self._snapshot_project(project)
+            self._snapshot_project(project)
         return project
 
     def get_project(self, project_id: str) -> Optional[Dict[str, Any]]:
@@ -307,7 +307,7 @@ class Storage:
             project["version"] = int(project.get("version", 0)) + 1
             project["updated_at"] = now_iso()
             atomic_write(path, project)
-        self._snapshot_project(project)
+            self._snapshot_project(project)
         return project
 
     def delete_project(self, project_id: str) -> bool:
@@ -316,6 +316,15 @@ class Storage:
             return False
         with locked(path + ".lock"):
             os.unlink(path)
+            # Remove every version snapshot of this project (plus its lock
+            # files), otherwise the history page and the system stats keep
+            # counting snapshots for projects that no longer exist.  This runs
+            # while holding the project lock so it cannot race with a snapshot
+            # being written by create/update/revert.
+            for vp in self._version_glob(project_id):
+                for p in (vp, vp + ".lock"):
+                    if os.path.isfile(p):
+                        os.unlink(p)
         return True
 
     # -- version history -------------------------------------------------- #
@@ -360,7 +369,7 @@ class Storage:
             restored["updated_at"] = now_iso()
             restored["reverted_from"] = int(current.get("version", 0))
             atomic_write(path, restored)
-        self._snapshot_project(restored)
+            self._snapshot_project(restored)
         return restored
 
     # -- stats ------------------------------------------------------------ #
